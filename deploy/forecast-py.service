@@ -1,0 +1,15 @@
+[Unit]
+Description=Python Demand Forecast Service
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/forecast_service_python
+EnvironmentFile=-/home/ec2-user/forecast_service_python/.env
+Environment=FORECAST_PORT=8001
+ExecStart=/home/ec2-user/forecast_service_python/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8001
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
