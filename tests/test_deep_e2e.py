@@ -92,11 +92,20 @@ def _base_payload(**overrides):
 
 
 def test_preprocess_outlier_iqr():
-    values = np.array([10.0, 11.0, 12.0, 13.0, 1000.0, 14.0], dtype=float)
+    # Long enough series for a stable IQR fence
+    values = np.array([10.0, 11.0, 12.0, 13.0, 12.5, 11.5, 12.2, 13.1, 1000.0, 14.0], dtype=float)
     steps = [{"id": "PP-OUT", "type": "outlier_correction", "enabled": True, "parameters": {"method": "iqr"}}]
     out, inter = apply_preprocessing(values, steps, return_intermediates=True)
     assert "PP-OUT" in inter
     assert out[-2] < 100  # spike corrected
+
+
+def test_preprocess_outlier_skips_short_intermittent_series():
+    # Sparse demand history: real spike must not be crushed to q3
+    values = np.array([200.0, 101.0, 121.0, 3000.0, 1000.0], dtype=float)
+    steps = [{"id": "PP-OUT", "type": "outlier_correction", "enabled": True, "parameters": {"method": "iqr"}}]
+    out, _ = apply_preprocessing(values, steps, return_intermediates=True)
+    assert abs(float(out[3]) - 3000.0) < 1e-6
 
 
 def test_preprocess_missing_forward_fill():

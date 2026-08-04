@@ -62,10 +62,16 @@ def trim_trailing_empty(
 
 
 def _outlier_correction(values: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+    """
+    Correct extreme values. For short / intermittent demand series (few observations),
+    IQR fences are unstable and can crush real spikes (e.g. 3000 → q3≈1000). Skip
+    correction unless there are enough points to estimate a fence reliably.
+    """
     out = values.copy().astype(float)
     method = str(params.get("method") or "iqr").lower()
     finite = out[np.isfinite(out)]
-    if finite.size < 3:
+    min_points = int(params.get("minPoints") or params.get("min_points") or 8)
+    if finite.size < max(3, min_points):
         return out
 
     if method == "z_score":
@@ -81,10 +87,17 @@ def _outlier_correction(values: np.ndarray, params: Dict[str, Any]) -> np.ndarra
         p_lo, p_hi = np.nanpercentile(finite, [lo, hi])
         out = np.clip(out, p_lo, p_hi)
     else:
-        # IQR (SAP-style default)
+        # IQR (SAP-style default). Prefer non-zero observations when series is intermittent
+        # so long zero stretches do not collapse the fence onto a few demand spikes.
+        nonzero = finite[np.abs(finite) > 1e-12]
+        sample = nonzero if nonzero.size >= min_points else finite
+        if sample.size < max(3, min_points):
+            return out
         multiplier = float(params.get("multiplier") or params.get("threshold") or 1.5)
-        q1, q3 = np.nanpercentile(finite, [25, 75])
+        q1, q3 = np.nanpercentile(sample, [25, 75])
         iqr = q3 - q1
+        if iqr < 1e-12:
+            return out
         low, high = q1 - multiplier * iqr, q3 + multiplier * iqr
         out = np.where(out < low, q1, out)
         out = np.where(out > high, q3, out)
