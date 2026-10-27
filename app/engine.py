@@ -113,7 +113,21 @@ def _fill_gaps(values: np.ndarray) -> np.ndarray:
     return arr
 
 
-def _as_algo_list(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _stage_flags(payload: Dict[str, Any]) -> Tuple[bool, bool, bool]:
+    """Return (run_preprocessing, run_forecasting, run_postprocessing)."""
+    raw = str(payload.get("profileType") or "").upper().strip()
+    if raw == "PREPROCESSING":
+        return True, False, False
+    if raw == "FORECASTING":
+        return False, True, False
+    if raw == "POSTPROCESSING":
+        return False, False, True
+    return True, True, True
+
+
+def _as_algo_list(payload: Dict[str, Any], run_forecasting: bool = True) -> List[Dict[str, Any]]:
+    if not run_forecasting:
+        return []
     steps = payload.get("forecastingSteps") or payload.get("algorithms") or []
     if isinstance(steps, dict):
         steps = [steps]
@@ -125,6 +139,9 @@ def _as_algo_list(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         out.append(s)
     if not out:
+        profile_type = str(payload.get("profileType") or "").upper().strip()
+        if profile_type in ("PREPROCESSING", "POSTPROCESSING"):
+            return []
         out = [{"id": "alg-default-ma", "type": "moving_average", "parameters": {"window": 3}, "enabled": True}]
     return out
 
@@ -244,12 +261,13 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not time_series:
         raise ValueError("timeSeries missing")
 
+    run_prep, run_fc, run_post = _stage_flags(payload)
     horizon = int(payload.get("forecastPeriods") or 6)
     horizon = max(1, horizon)
     granularity = str(payload.get("timeGranularity") or "monthly")
-    algorithms = _as_algo_list(payload)
-    strategy = extract_selection_strategy(payload.get("postprocessingSteps"))
-    bias_cfg = resolve_bias_config(payload.get("postprocessingSteps"))
+    algorithms = _as_algo_list(payload, run_fc)
+    strategy = extract_selection_strategy(payload.get("postprocessingSteps")) if run_post or run_fc else "best_fit"
+    bias_cfg = resolve_bias_config(payload.get("postprocessingSteps")) if run_post else None
     measures = payload.get("errorMeasures") or ["MAPE"]
     if isinstance(measures, str):
         measures = [measures]
@@ -264,7 +282,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         error_horizon = None
 
-    prep_steps = payload.get("preprocessingSteps") or []
+    prep_steps = payload.get("preprocessingSteps") or [] if run_prep else []
     if isinstance(prep_steps, dict):
         prep_steps = [prep_steps]
 
@@ -340,6 +358,9 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 )
 
+        if not run_fc and not run_post:
+            continue
+
         candidates: Dict[str, np.ndarray] = {}
         fitted_by_name: Dict[str, np.ndarray] = {}
         std_by_name: Dict[str, float] = {}
@@ -387,7 +408,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
             std = std_by_name.get(selected_name, 0.0)
 
             # Bias correction on selected forecast
-            if bias_cfg is not None:
+            if run_post and bias_cfg is not None:
                 fit_arr = np.asarray(fitted, dtype=float).ravel()
                 if fit_arr.size < values.size:
                     pad = float(np.nanmean(values))
@@ -475,7 +496,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
         k: float(np.mean(vs)) for k, vs in error_accum.items() if vs and np.isfinite(np.mean(vs))
     }
 
-    if not all_forecasts:
+    if not all_forecasts and run_fc:
         first = time_series[0] if time_series else {}
         po = str((first or {}).get("planningObjectId") or "UNKNOWN")
         all_forecasts = [{"planningObjectId": po, "timeBucket": "1970-01", "value": 0.0}]
