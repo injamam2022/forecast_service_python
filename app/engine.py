@@ -113,6 +113,52 @@ def _fill_gaps(values: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _stored_forecast_points(payload: Dict[str, Any], po_id: str) -> List[Dict[str, Any]]:
+    """Future/stored forecast series written by a prior forecasting profile."""
+    raw = payload.get("storedForecasts")
+    if not isinstance(raw, dict) or not raw:
+        return []
+    post = payload.get("postprocessingSteps") or {}
+    preferred: List[str] = []
+    if isinstance(post, dict):
+        for key in (
+            "finalInputKeyFigureId",
+            "biasInputKeyFigureId",
+            "errorInputKeyFigureId",
+            "snapshotInputKeyFigureId",
+        ):
+            val = post.get(key)
+            if val:
+                preferred.append(str(val))
+    keys = preferred + [str(k) for k in raw.keys() if str(k) not in preferred]
+    for kf_id in keys:
+        entries = raw.get(kf_id) or raw.get(str(kf_id)) or []
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("planningObjectId") or "").strip() != po_id:
+                continue
+            points: List[Dict[str, Any]] = []
+            for item in entry.get("series") or []:
+                if not isinstance(item, dict):
+                    continue
+                tb = str(item.get("timeBucket") or "").strip()
+                if not tb:
+                    continue
+                try:
+                    val = float(item.get("value") if item.get("value") is not None else 0)
+                except (TypeError, ValueError):
+                    val = 0.0
+                if not np.isfinite(val):
+                    val = 0.0
+                points.append({"timeBucket": tb, "value": val})
+            points.sort(key=lambda p: str(p["timeBucket"]))
+            return points
+    return []
+
+
 def _stage_flags(payload: Dict[str, Any]) -> Tuple[bool, bool, bool]:
     """Return (run_preprocessing, run_forecasting, run_postprocessing)."""
     raw = str(payload.get("profileType") or "").upper().strip()
@@ -314,35 +360,39 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
         location_id = obj.get("locationId")
 
         buckets, values = clean_history(obj.get("series") or [])
-        if values.size == 0:
+        stored_fc_early = _stored_forecast_points(payload, po_id) if (run_post and not run_fc) else []
+        if values.size == 0 and not stored_fc_early:
             continue
 
         # Drop trailing blank/zero months (empty grid cells) so trend continues: 40,30,20 → 10,0,-10,...
-        buckets, values = trim_trailing_empty(buckets, values)
-        if values.size == 0:
+        if values.size:
+            buckets, values = trim_trailing_empty(buckets, values)
+        if values.size == 0 and not stored_fc_early:
             continue
 
-        series_by_kf = _series_by_key_figure(payload, po_id, buckets)
-        kf_outputs: Dict[str, np.ndarray] = {}
-        values, intermediates = apply_preprocessing(
-            values,
-            prep_steps,
-            return_intermediates=True,
-            series_by_kf=series_by_kf,
-            kf_outputs=kf_outputs,
-        )
+        intermediates: Dict[str, Any] = {}
+        if values.size:
+            series_by_kf = _series_by_key_figure(payload, po_id, buckets)
+            kf_outputs: Dict[str, np.ndarray] = {}
+            values, intermediates = apply_preprocessing(
+                values,
+                prep_steps,
+                return_intermediates=True,
+                series_by_kf=series_by_kf,
+                kf_outputs=kf_outputs,
+            )
 
-        # Forecasting reads its own Input KF, which is normally a preprocessing Output KF
-        forecast_input_kf = str(payload.get("inputKeyFigure") or "").strip()
-        if forecast_input_kf:
-            if forecast_input_kf in kf_outputs:
-                values = np.asarray(kf_outputs[forecast_input_kf], dtype=float).copy()
-            elif forecast_input_kf in series_by_kf and forecast_input_kf != primary_kf:
-                values = np.asarray(series_by_kf[forecast_input_kf], dtype=float).copy()
+            # Forecasting reads its own Input KF, which is normally a preprocessing Output KF
+            forecast_input_kf = str(payload.get("inputKeyFigure") or "").strip()
+            if forecast_input_kf:
+                if forecast_input_kf in kf_outputs:
+                    values = np.asarray(kf_outputs[forecast_input_kf], dtype=float).copy()
+                elif forecast_input_kf in series_by_kf and forecast_input_kf != primary_kf:
+                    values = np.asarray(series_by_kf[forecast_input_kf], dtype=float).copy()
 
-        values = _fill_gaps(values)
-        if values.size == 0:
-            continue
+            values = _fill_gaps(values)
+            if values.size == 0 and not stored_fc_early:
+                continue
 
         # Write preprocessing intermediate series (historical buckets)
         for step_id, series_vals in intermediates.items():
@@ -359,6 +409,49 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
         if not run_fc and not run_post:
+            continue
+
+        stored_fc = stored_fc_early
+        if run_post and not run_fc:
+            if not stored_fc:
+                continue
+            forecast_points = list(stored_fc)
+            if bias_cfg is not None and values.size and buckets:
+                hist_lookup = {
+                    str(tb): float(values[i])
+                    for i, tb in enumerate(buckets)
+                    if i < values.size and np.isfinite(values[i])
+                }
+                residuals = []
+                for pt in forecast_points:
+                    actual = None
+                    for key in _bucket_variants(pt["timeBucket"]):
+                        if key in hist_lookup:
+                            actual = hist_lookup[key]
+                            break
+                    if actual is None:
+                        continue
+                    residuals.append(pt["value"] - actual)
+                if residuals:
+                    corrected = apply_bias_correction(
+                        np.array([pt["value"] for pt in forecast_points], dtype=float),
+                        np.array(residuals, dtype=float),
+                        method=bias_cfg.get("method", "mean"),
+                        lookback=int(bias_cfg.get("lookbackPeriods") or 12),
+                    )
+                    for i, pt in enumerate(forecast_points):
+                        if i < corrected.size and np.isfinite(corrected[i]):
+                            pt["value"] = float(corrected[i])
+            for pt in forecast_points:
+                all_forecasts.append(
+                    {
+                        "planningObjectId": po_id,
+                        "productId": product_id,
+                        "locationId": location_id,
+                        "timeBucket": pt["timeBucket"],
+                        "value": float(pt["value"]),
+                    }
+                )
             continue
 
         candidates: Dict[str, np.ndarray] = {}
