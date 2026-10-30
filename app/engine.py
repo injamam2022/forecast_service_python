@@ -356,8 +356,10 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
         po_id = str(obj.get("planningObjectId") or "").strip()
         if not po_id:
             continue
-        product_id = obj.get("productId")
-        location_id = obj.get("locationId")
+        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+        product_id = obj.get("productId") or attrs.get("product_id") or attrs.get("PRODUCT_ID")
+        location_id = obj.get("locationId") or attrs.get("location_id") or attrs.get("LOCATION_ID")
+        customer_id = obj.get("customerId") or attrs.get("customer_id") or attrs.get("CUSTOMER_ID")
 
         buckets, values = clean_history(obj.get("series") or [])
         stored_fc_early = _stored_forecast_points(payload, po_id) if (run_post and not run_fc) else []
@@ -403,6 +405,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "planningObjectId": po_id,
                         "productId": product_id,
                         "locationId": location_id,
+                        "customerId": customer_id,
                         "timeBucket": tb,
                         "value": float(v) if np.isfinite(v) else 0.0,
                     }
