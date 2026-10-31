@@ -71,26 +71,68 @@ def _align_to_buckets(series: List[Any], buckets: List[str]) -> np.ndarray:
     return out
 
 
+def _series_entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str]:
+    attrs = entry.get("attributes") if isinstance(entry.get("attributes"), dict) else {}
+    pid = str(
+        entry.get("productId")
+        or attrs.get("product_id")
+        or attrs.get("PRODUCT_ID")
+        or ""
+    ).strip()
+    lid = str(
+        entry.get("locationId")
+        or attrs.get("location_id")
+        or attrs.get("LOCATION_ID")
+        or ""
+    ).strip()
+    cid = str(
+        entry.get("customerId")
+        or attrs.get("customer_id")
+        or attrs.get("CUSTOMER_ID")
+        or ""
+    ).strip()
+    return pid, lid, cid
+
+
 def _series_by_key_figure(
     payload: Dict[str, Any],
     po_id: str,
     buckets: List[str],
+    attrs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, np.ndarray]:
-    """Per-key-figure history for this planning object, aligned to the primary buckets."""
+    """Per-key-figure history for this planning object, aligned to the primary buckets.
+
+    Prefer exact planningObjectId / seriesId match. Fall back to Product×Location×Customer
+    identity so Adjusted Sales History UI edits on a sibling PO still feed Missing/Manual.
+    """
     raw = payload.get("seriesByKeyFigure") or {}
     if not isinstance(raw, dict):
         return {}
+    attrs = attrs if isinstance(attrs, dict) else {}
+    want_pid = str(attrs.get("product_id") or attrs.get("PRODUCT_ID") or "").strip()
+    want_lid = str(attrs.get("location_id") or attrs.get("LOCATION_ID") or "").strip()
+    want_cid = str(attrs.get("customer_id") or attrs.get("CUSTOMER_ID") or "").strip()
     resolved: Dict[str, np.ndarray] = {}
     for kf_id, entries in raw.items():
         if not isinstance(entries, list):
             continue
+        matched = None
+        identity_hit = None
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            if str(entry.get("planningObjectId") or "").strip() != po_id:
-                continue
-            resolved[str(kf_id)] = _align_to_buckets(entry.get("series") or [], buckets)
-            break
+            entry_po = str(entry.get("planningObjectId") or "").strip()
+            entry_base = str(entry.get("basePlanningObjectId") or "").strip()
+            if entry_po == po_id or (entry_base and entry_base == po_id):
+                matched = entry
+                break
+            if want_pid and want_lid and want_cid:
+                ep, el, ec = _series_entry_identity(entry)
+                if ep == want_pid and el == want_lid and ec == want_cid:
+                    identity_hit = entry
+        chosen = matched or identity_hit
+        if chosen is not None:
+            resolved[str(kf_id)] = _align_to_buckets(chosen.get("series") or [], buckets)
     return resolved
 
 
@@ -374,7 +416,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         intermediates: Dict[str, Any] = {}
         if values.size:
-            series_by_kf = _series_by_key_figure(payload, po_id, buckets)
+            series_by_kf = _series_by_key_figure(payload, po_id, buckets, attrs)
             kf_outputs: Dict[str, np.ndarray] = {}
             values, intermediates = apply_preprocessing(
                 values,
