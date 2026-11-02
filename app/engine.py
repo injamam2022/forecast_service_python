@@ -46,9 +46,16 @@ def _bucket_variants(bucket: str) -> List[str]:
     return variants
 
 
-def _align_to_buckets(series: List[Any], buckets: List[str]) -> np.ndarray:
-    """Map a raw {timeBucket, value} list onto the primary bucket axis (NaN when absent)."""
+def _align_to_buckets(
+    series: List[Any], buckets: List[str]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map a raw {timeBucket, value} list onto the primary bucket axis (NaN when absent).
+
+    Overlay-flagged points (planner Adjusted edits, including 0) overwrite earlier
+    Sales History copies for the same month. setdefault would keep 273 and drop 0.
+    """
     lookup: Dict[str, float] = {}
+    overlay_lookup: Dict[str, bool] = {}
     for item in series or []:
         if not isinstance(item, dict):
             continue
@@ -59,16 +66,21 @@ def _align_to_buckets(series: List[Any], buckets: List[str]) -> np.ndarray:
             val = float(item.get("value") if item.get("value") is not None else 0)
         except (TypeError, ValueError):
             val = np.nan
+        overlay = bool(item.get("overlay") or item.get("adjustedHistoryOverlay"))
         for key in _bucket_variants(tb):
-            lookup.setdefault(key, val)
+            if overlay or key not in lookup:
+                lookup[key] = val
+                overlay_lookup[key] = overlay or overlay_lookup.get(key, False)
 
     out = np.full(len(buckets), np.nan, dtype=float)
+    mask = np.zeros(len(buckets), dtype=bool)
     for i, bucket in enumerate(buckets):
         for key in _bucket_variants(bucket):
             if key in lookup:
                 out[i] = lookup[key]
+                mask[i] = bool(overlay_lookup.get(key))
                 break
-    return out
+    return out, mask
 
 
 def _series_entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -99,41 +111,57 @@ def _series_by_key_figure(
     po_id: str,
     buckets: List[str],
     attrs: Optional[Dict[str, Any]] = None,
-) -> Dict[str, np.ndarray]:
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """Per-key-figure history for this planning object, aligned to the primary buckets.
 
     Prefer exact planningObjectId / seriesId match. Fall back to Product×Location×Customer
     identity so Adjusted Sales History UI edits on a sibling PO still feed Missing/Manual.
+    P×L edits (including explicit 0) overlay onto the matched series so Mean does not
+    treat cleared cells as empty.
     """
     raw = payload.get("seriesByKeyFigure") or {}
     if not isinstance(raw, dict):
-        return {}
+        return {}, {}
     attrs = attrs if isinstance(attrs, dict) else {}
     want_pid = str(attrs.get("product_id") or attrs.get("PRODUCT_ID") or "").strip()
     want_lid = str(attrs.get("location_id") or attrs.get("LOCATION_ID") or "").strip()
     want_cid = str(attrs.get("customer_id") or attrs.get("CUSTOMER_ID") or "").strip()
     resolved: Dict[str, np.ndarray] = {}
+    overlay_masks: Dict[str, np.ndarray] = {}
     for kf_id, entries in raw.items():
         if not isinstance(entries, list):
             continue
         matched = None
         identity_hit = None
+        pl_hit = None
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
             entry_po = str(entry.get("planningObjectId") or "").strip()
             entry_base = str(entry.get("basePlanningObjectId") or "").strip()
-            if entry_po == po_id or (entry_base and entry_base == po_id):
+            if matched is None and (entry_po == po_id or (entry_base and entry_base == po_id)):
                 matched = entry
-                break
-            if want_pid and want_lid and want_cid:
-                ep, el, ec = _series_entry_identity(entry)
-                if ep == want_pid and el == want_lid and ec == want_cid:
-                    identity_hit = entry
-        chosen = matched or identity_hit
-        if chosen is not None:
-            resolved[str(kf_id)] = _align_to_buckets(chosen.get("series") or [], buckets)
-    return resolved
+                # keep scanning for a P×L edit series — do not break
+            ep, el, ec = _series_entry_identity(entry)
+            if want_pid and want_lid and want_cid and ep == want_pid and el == want_lid and ec == want_cid:
+                identity_hit = entry
+            # P×L Adjusted edits (no customer) apply to every customer leaf of that warehouse.
+            if want_pid and want_lid and ep == want_pid and el == want_lid and not ec:
+                pl_hit = entry
+        chosen = matched or identity_hit or pl_hit
+        if chosen is None:
+            continue
+        arr, mask = _align_to_buckets(chosen.get("series") or [], buckets)
+        if pl_hit is not None and pl_hit is not chosen:
+            pl_arr, _pl_mask = _align_to_buckets(pl_hit.get("series") or [], buckets)
+            finite_pl = np.isfinite(pl_arr)
+            arr = np.where(finite_pl, pl_arr, arr)
+            # P×L Adjusted cells (including 0) are planner edits — protect from IQR.
+            mask = np.where(finite_pl, True, mask)
+            mask = np.asarray(mask, dtype=bool)
+        resolved[str(kf_id)] = arr
+        overlay_masks[str(kf_id)] = mask
+    return resolved, overlay_masks
 
 
 def _fill_gaps(values: np.ndarray) -> np.ndarray:
@@ -416,7 +444,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         intermediates: Dict[str, Any] = {}
         if values.size:
-            series_by_kf = _series_by_key_figure(payload, po_id, buckets, attrs)
+            series_by_kf, series_overlay = _series_by_key_figure(payload, po_id, buckets, attrs)
             kf_outputs: Dict[str, np.ndarray] = {}
             values, intermediates = apply_preprocessing(
                 values,
@@ -424,6 +452,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return_intermediates=True,
                 series_by_kf=series_by_kf,
                 kf_outputs=kf_outputs,
+                series_overlay=series_overlay,
             )
 
             # Forecasting reads its own Input KF, which is normally a preprocessing Output KF

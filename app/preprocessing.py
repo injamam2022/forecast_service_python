@@ -61,7 +61,11 @@ def trim_trailing_empty(
     return buckets[:end], vals[:end]
 
 
-def _outlier_correction(values: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+def _outlier_correction(
+    values: np.ndarray,
+    params: Dict[str, Any],
+    protect_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
     Correct extreme values. For short / intermittent demand series (few observations),
     IQR fences are unstable and can crush real spikes (e.g. 3000 → q3≈1000). Skip
@@ -99,8 +103,17 @@ def _outlier_correction(values: np.ndarray, params: Dict[str, Any]) -> np.ndarra
         if iqr < 1e-12:
             return out
         low, high = q1 - multiplier * iqr, q3 + multiplier * iqr
-        out = np.where(out < low, q1, out)
+        # Keep explicit zeros (intermittent demand / cleared Adjusted cells). A 0 is
+        # not an IQR low-outlier — replacing it with q1 ignored grid edits of 0.
+        finite_low = np.isfinite(out) & (np.abs(out) > 1e-12) & (out < low)
+        out = np.where(finite_low, q1, out)
         out = np.where(out > high, q3, out)
+        # Planner-entered Adjusted cells (including a typed 0 or 1000) must survive IQR.
+        if protect_mask is not None:
+            guard = np.asarray(protect_mask, dtype=bool)
+            if guard.shape == out.shape:
+                orig = np.asarray(values, dtype=float)
+                out = np.where(guard, orig, out)
     return out
 
 
@@ -182,7 +195,11 @@ def _historical_adjustment(values: np.ndarray, params: Dict[str, Any]) -> np.nda
     return out * val
 
 
-def apply_step(values: np.ndarray, step: Dict[str, Any]) -> np.ndarray:
+def apply_step(
+    values: np.ndarray,
+    step: Dict[str, Any],
+    protect_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
     if not step or step.get("enabled") is False:
         return values
     stype = str(step.get("type") or "").lower().strip()
@@ -191,7 +208,7 @@ def apply_step(values: np.ndarray, step: Dict[str, Any]) -> np.ndarray:
         params = {}
 
     if stype in ("outlier_correction", "outlier"):
-        return _outlier_correction(values, params)
+        return _outlier_correction(values, params, protect_mask=protect_mask)
     if stype in ("missing_value_handling", "missing_value", "missing"):
         return _missing_value_handling(values, params)
     if stype == "substitution":
@@ -243,6 +260,7 @@ def apply_preprocessing(
     return_intermediates: bool = False,
     series_by_kf: Optional[Dict[str, np.ndarray]] = None,
     kf_outputs: Optional[Dict[str, np.ndarray]] = None,
+    series_overlay: Optional[Dict[str, np.ndarray]] = None,
 ) -> Any:
     """
     Apply preprocessing steps in order.
@@ -265,7 +283,13 @@ def apply_preprocessing(
         if step.get("enabled") is False:
             continue
         step_input = _resolve_step_input(step, current, produced, series_by_kf)
-        current = apply_step(step_input, step)
+        in_kf, _ = step_key_figures(step)
+        protect = None
+        if series_overlay and in_kf and in_kf in series_overlay:
+            protect = np.asarray(series_overlay[in_kf], dtype=bool)
+            if protect.size != step_input.size:
+                protect = None
+        current = apply_step(step_input, step, protect_mask=protect)
         step_id = str(step.get("stepId") or step.get("id") or step.get("type") or "")
         if step_id:
             intermediates[step_id] = current.copy()
