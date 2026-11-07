@@ -444,7 +444,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         intermediates: Dict[str, Any] = {}
         if values.size:
-            series_by_kf, series_overlay = _series_by_key_figure(payload, po_id, buckets, attrs)
+            series_by_kf, _ = _series_by_key_figure(payload, po_id, buckets, attrs)
             kf_outputs: Dict[str, np.ndarray] = {}
             values, intermediates = apply_preprocessing(
                 values,
@@ -452,7 +452,6 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return_intermediates=True,
                 series_by_kf=series_by_kf,
                 kf_outputs=kf_outputs,
-                series_overlay=series_overlay,
             )
 
             # Forecasting reads its own Input KF, which is normally a preprocessing Output KF
