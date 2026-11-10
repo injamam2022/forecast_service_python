@@ -33,40 +33,24 @@ def forecast_gradient_boosting(
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    model = None
+    # XGBoost is a required dependency. Without it the model fails (and is reported in
+    # algorithmFailures) instead of silently switching to a different model, which made
+    # the same profile produce different numbers on different machines.
     try:
         import xgboost as xgb
+    except ImportError as exc:
+        raise RuntimeError("gradient_boosting needs the xgboost package (pip install -r requirements.txt)") from exc
 
-        model = xgb.XGBRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            objective="reg:squarederror",
-            verbosity=0,
-        )
-        model.fit(X, y)
-    except Exception:
-        try:
-            from sklearn.ensemble import GradientBoostingRegressor
-
-            model = GradientBoostingRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-            )
-            model.fit(X, y)
-        except Exception:
-            # No ML libs available — recursive lag mean
-            mean = float(np.mean(hist))
-            fitted = np.full(hist.size, mean)
-            series = list(hist.astype(float))
-            forecasts = []
-            for _ in range(horizon):
-                nxt = float(np.mean(series[-lags:]))
-                forecasts.append(nxt)
-                series.append(nxt)
-            fc = np.asarray(forecasts, dtype=float)
-            return fc, fitted, float(np.std(hist)) if hist.size else 0.0
+    model = xgb.XGBRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        objective="reg:squarederror",
+        verbosity=0,
+        random_state=int(params.get("random_state") or 0),
+        n_jobs=1,
+    )
+    model.fit(X, y)
 
     # In-sample fitted (pad first lags with mean)
     fitted = np.full(hist.size, float(np.mean(hist)))

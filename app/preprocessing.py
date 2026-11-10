@@ -61,7 +61,18 @@ def trim_trailing_empty(
     return buckets[:end], vals[:end]
 
 
-def _outlier_correction(values: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+def _protect_planner_edits(params: Dict[str, Any]) -> bool:
+    raw = params.get("protectPlannerEdits", params.get("protect_planner_edits", True))
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+    return bool(raw)
+
+
+def _outlier_correction(
+    values: np.ndarray,
+    params: Dict[str, Any],
+    protect_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
     Correct extreme values. For short / intermittent demand series (few observations),
     IQR fences are unstable and can crush real spikes (e.g. 3000 → q3≈1000). Skip
@@ -99,11 +110,28 @@ def _outlier_correction(values: np.ndarray, params: Dict[str, Any]) -> np.ndarra
         if iqr < 1e-12:
             return out
         low, high = q1 - multiplier * iqr, q3 + multiplier * iqr
+        # Replace outliers with the outlier limit itself (default "fence"), so a real
+        # promotion spike is tempered, not flattened to an ordinary month.
+        # replaceWith = "q3" keeps the older behaviour (Q1/Q3), "median" uses the median.
+        replace_with = str(params.get("replaceWith") or params.get("replace_with") or "fence").lower()
+        if replace_with == "q3":
+            low_val, high_val = q1, q3
+        elif replace_with == "median":
+            med = float(np.nanmedian(sample))
+            low_val, high_val = med, med
+        else:
+            low_val, high_val = low, high
         # Keep explicit zeros (intermittent demand / cleared Adjusted cells). A 0 is
         # not an IQR low-outlier — replacing it with q1 ignored grid edits of 0.
         finite_low = np.isfinite(out) & (np.abs(out) > 1e-12) & (out < low)
-        out = np.where(finite_low, q1, out)
-        out = np.where(out > high, q3, out)
+        out = np.where(finite_low, low_val, out)
+        out = np.where(out > high, high_val, out)
+    # Planner-entered cells (a typed 0 or 1000) are deliberate — keep them as entered
+    # unless the step sets protectPlannerEdits = false.
+    if protect_mask is not None and _protect_planner_edits(params):
+        guard = np.asarray(protect_mask, dtype=bool)
+        if guard.shape == out.shape:
+            out = np.where(guard, np.asarray(values, dtype=float), out)
     return out
 
 
@@ -158,18 +186,44 @@ def _missing_value_handling(values: np.ndarray, params: Dict[str, Any]) -> np.nd
     return out
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def _substitution(values: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+    """Substitution needs an explicit rule and value.
+
+    A missing value used to default to 0 and the default rule replaced the whole
+    history — one unconfigured step silently produced a zero forecast.
+    """
     out = values.copy().astype(float)
-    rule = str(params.get("rule") or "replace").lower()
-    val = float(params.get("value") or 0)
+    rule_raw = params.get("rule")
+    if rule_raw is None or str(rule_raw).strip() == "":
+        raise ValueError("Substitution step needs a rule (replace, add or multiply).")
+    rule = str(rule_raw).lower().strip()
+    raw_value = params.get("value")
+    try:
+        val = float(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError("Substitution step needs a numeric value.")
+    if not np.isfinite(val):
+        raise ValueError("Substitution step needs a numeric value.")
     if rule == "multiply":
         return out * val
     if rule == "add":
         return out + val
-    # replace all with constant (or only zeros if replaceZeros flag)
-    if params.get("replaceZeros"):
+    if rule != "replace":
+        raise ValueError(f"Unknown substitution rule '{rule_raw}'. Use replace, add or multiply.")
+    if _truthy(params.get("replaceZeros")):
         out[out == 0] = val
         return out
+    if not _truthy(params.get("replaceAll")):
+        raise ValueError(
+            "Substitution 'replace' overwrites every history value. Set replaceZeros to replace only "
+            "zeros, or replaceAll to confirm replacing the whole history."
+        )
     return np.full_like(out, val)
 
 
@@ -185,7 +239,11 @@ def _historical_adjustment(values: np.ndarray, params: Dict[str, Any]) -> np.nda
     return out * val
 
 
-def apply_step(values: np.ndarray, step: Dict[str, Any]) -> np.ndarray:
+def apply_step(
+    values: np.ndarray,
+    step: Dict[str, Any],
+    protect_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
     if not step or step.get("enabled") is False:
         return values
     stype = str(step.get("type") or "").lower().strip()
@@ -194,7 +252,7 @@ def apply_step(values: np.ndarray, step: Dict[str, Any]) -> np.ndarray:
         params = {}
 
     if stype in ("outlier_correction", "outlier"):
-        return _outlier_correction(values, params)
+        return _outlier_correction(values, params, protect_mask=protect_mask)
     if stype in ("missing_value_handling", "missing_value", "missing"):
         return _missing_value_handling(values, params)
     if stype == "substitution":
@@ -246,6 +304,7 @@ def apply_preprocessing(
     return_intermediates: bool = False,
     series_by_kf: Optional[Dict[str, np.ndarray]] = None,
     kf_outputs: Optional[Dict[str, np.ndarray]] = None,
+    series_overlay: Optional[Dict[str, np.ndarray]] = None,
 ) -> Any:
     """
     Apply preprocessing steps in order.
@@ -268,7 +327,13 @@ def apply_preprocessing(
         if step.get("enabled") is False:
             continue
         step_input = _resolve_step_input(step, current, produced, series_by_kf)
-        current = apply_step(step_input, step)
+        in_kf, _ = step_key_figures(step)
+        protect = None
+        if series_overlay and in_kf and in_kf in series_overlay and in_kf not in produced:
+            protect = np.asarray(series_overlay[in_kf], dtype=bool)
+            if protect.size != step_input.size:
+                protect = None
+        current = apply_step(step_input, step, protect_mask=protect)
         step_id = str(step.get("stepId") or step.get("id") or step.get("type") or "")
         if step_id:
             intermediates[step_id] = current.copy()

@@ -5,9 +5,14 @@ After=network.target
 [Service]
 User=ec2-user
 WorkingDirectory=/home/ec2-user/forecast_service_python
-EnvironmentFile=-/home/ec2-user/forecast_service_python/.env
+# Defaults; values in .env override them. Keep FORECAST_HOST=127.0.0.1 when the Node API
+# runs on the same server. Set 0.0.0.0 only when the API is on another host AND the
+# firewall allows port 8001 from that host only.
+Environment=FORECAST_HOST=127.0.0.1
 Environment=FORECAST_PORT=8001
-ExecStart=/home/ec2-user/forecast_service_python/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8001
+Environment=FORECAST_WORKERS=2
+EnvironmentFile=-/home/ec2-user/forecast_service_python/.env
+ExecStart=/home/ec2-user/forecast_service_python/.venv/bin/uvicorn main:app --host ${FORECAST_HOST} --port ${FORECAST_PORT} --workers ${FORECAST_WORKERS}
 Restart=always
 RestartSec=5
 

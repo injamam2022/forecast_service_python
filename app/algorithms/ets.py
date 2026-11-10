@@ -7,6 +7,53 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+def _auto_ets(hist: np.ndarray, horizon: int, seasonal_periods: int):
+    """Pick the ETS structure with the lowest AICc; None when nothing fits."""
+    try:
+        from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+    except Exception:
+        return None
+    seasonal_ok = seasonal_periods and seasonal_periods > 1 and hist.size >= seasonal_periods * 2
+    configs = []
+    for seasonal in ([None, "add"] if seasonal_ok else [None]):
+        configs.append({"trend": None, "damped_trend": False, "seasonal": seasonal})
+        if hist.size >= 4:
+            configs.append({"trend": "add", "damped_trend": False, "seasonal": seasonal})
+            configs.append({"trend": "add", "damped_trend": True, "seasonal": seasonal})
+    best = None
+    import warnings
+
+    for cfg in configs:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model = ETSModel(
+                    hist,
+                    error="add",
+                    trend=cfg["trend"],
+                    damped_trend=cfg["damped_trend"],
+                    seasonal=cfg["seasonal"],
+                    seasonal_periods=seasonal_periods if cfg["seasonal"] else None,
+                )
+                fit = model.fit(disp=False)
+            score = float(getattr(fit, "aicc", np.nan))
+            if not np.isfinite(score):
+                score = float(getattr(fit, "aic", np.inf))
+            if best is None or score < best[0]:
+                best = (score, fit)
+        except Exception:
+            continue
+    if best is None:
+        return None
+    fit = best[1]
+    fc = np.asarray(fit.forecast(horizon), dtype=float)
+    fitted = np.asarray(fit.fittedvalues, dtype=float)[: hist.size]
+    resid = hist - fitted
+    resid = resid[np.isfinite(resid)]
+    std = float(np.std(resid)) if resid.size else 0.0
+    return fc, fitted, std
+
+
 def forecast_exponential_smoothing(
     history: np.ndarray,
     horizon: int,
@@ -65,28 +112,14 @@ def forecast_exponential_smoothing(
 
     try:
         if mode == "auto":
-            # Prefer statsmodels ETS auto if available
-            try:
-                from statsmodels.tsa.exponential_smoothing.ets import ETSModel
-
-                auto_model = ETSModel(
-                    hist,
-                    error="add",
-                    trend="add",
-                    seasonal="add" if hist.size >= seasonal_periods * 2 else None,
-                    seasonal_periods=seasonal_periods if hist.size >= seasonal_periods * 2 else None,
-                )
-                auto_fit = auto_model.fit(disp=False)
-                fc = np.asarray(auto_fit.forecast(horizon), dtype=float)
-                fitted = np.asarray(auto_fit.fittedvalues, dtype=float)[: hist.size]
-                resid = hist - fitted
-                resid = resid[np.isfinite(resid)]
-                std = float(np.std(resid)) if resid.size else 0.0
+            # Real automatic ETS: fit level-only, additive trend and damped trend (each
+            # with additive seasonality when ≥ 2 full seasons) and keep the lowest AICc.
+            auto = _auto_ets(hist, horizon, seasonal_periods)
+            if auto is not None:
+                fc, fitted, std = auto
                 if np.nanmin(hist) >= 0:
                     fc = np.maximum(fc, 0.0)
                 return fc, fitted, std
-            except Exception:
-                pass
 
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
 

@@ -13,6 +13,11 @@ def _std_from_fit(hist: np.ndarray, fitted: np.ndarray) -> float:
     return float(np.std(resid)) if resid.size else 0.0
 
 
+# Fitted values in this module are ONE-STEP-AHEAD: fitted[i] uses only periods before i
+# (fitted[0] is NaN — nothing to forecast from). Error metrics and bias correction then
+# measure real forecast error instead of how well a window fits its own point.
+
+
 def _normalize_weights(weights: List[float], n: int) -> np.ndarray:
     if not weights or len(weights) == 0:
         # Linear increasing weights (older → smaller)
@@ -41,7 +46,9 @@ def forecast_simple_average(
     if hist.size == 0:
         return np.zeros(horizon), np.array([]), 0.0
     mean = float(np.mean(hist))
-    fitted = np.full(hist.size, mean)
+    fitted = np.full(hist.size, np.nan)
+    if hist.size > 1:
+        fitted[1:] = np.cumsum(hist)[:-1] / np.arange(1, hist.size)
     fc = np.full(horizon, mean)
     return fc, fitted, _std_from_fit(hist, fitted)
 
@@ -67,9 +74,9 @@ def forecast_simple_moving_average(
     mode = str(params.get("forecastMode") or params.get("mode") or "rolling").lower()
 
     fitted = np.full(hist.size, np.nan)
-    for i in range(hist.size):
-        start = max(0, i - window + 1)
-        fitted[i] = float(np.mean(hist[start : i + 1]))
+    for i in range(1, hist.size):
+        start = max(0, i - window)
+        fitted[i] = float(np.mean(hist[start:i]))
 
     last_ma = float(np.mean(hist[-window:]))
 
@@ -114,11 +121,11 @@ def forecast_weighted_average(
 
     w = _normalize_weights(list(weights), segment.size)
     level = float(np.dot(segment, w))
-    fitted = np.full(hist.size, level)
-    # better in-sample: expanding weighted mean on trailing lookback
-    for i in range(hist.size):
-        start = max(0, i - lookback + 1)
-        seg = hist[start : i + 1]
+    fitted = np.full(hist.size, np.nan)
+    # one-step-ahead: weighted mean of the trailing lookback BEFORE period i
+    for i in range(1, hist.size):
+        start = max(0, i - lookback)
+        seg = hist[start:i]
         ww = _normalize_weights(list(weights), seg.size)
         fitted[i] = float(np.dot(seg, ww))
     fc = np.full(horizon, level)
@@ -157,9 +164,9 @@ def forecast_weighted_moving_average(
         return float(np.dot(np.asarray(values, dtype=float), w))
 
     fitted = np.full(hist.size, np.nan)
-    for i in range(hist.size):
-        start = max(0, i - window + 1)
-        fitted[i] = wma(list(hist[start : i + 1]))
+    for i in range(1, hist.size):
+        start = max(0, i - window)
+        fitted[i] = wma(list(hist[start:i]))
 
     last = wma(list(hist[-window:]))
 

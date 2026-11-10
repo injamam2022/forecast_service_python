@@ -29,13 +29,23 @@ def forecast_sarima(
     Q = int(params.get("Q") if params.get("Q") is not None else 1)
     m = int(params.get("m") or params.get("seasonal_periods") or seasonal_periods)
 
-    # Disable seasonal if not enough history
-    use_seasonal = hist.size >= m * 2
+    # Orders are capped (large orders on short demand series do not converge).
+    p, q, P, Q = (min(max(0, v), 3) for v in (p, q, P, Q))
+    d, D = min(max(0, d), 2), min(max(0, D), 1)
+    # Seasonal terms need 2 full seasons; seasonal differencing needs 3.
+    use_seasonal = m > 1 and hist.size >= m * 2
+    if use_seasonal and hist.size < m * 3:
+        D = 0
     seasonal_order = (P, D, Q, m) if use_seasonal else (0, 0, 0, 0)
 
-    try:
-        from statsmodels.tsa.statespace.sarimax import SARIMAX
+    import warnings
 
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+    # A failed fit raises: the engine reports it (algorithmFailures) instead of
+    # silently writing the plain mean under the SARIMA name.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         model = SARIMAX(
             hist,
             order=(p, d, q),
@@ -44,14 +54,13 @@ def forecast_sarima(
             enforce_invertibility=False,
         )
         fit = model.fit(disp=False)
-        fc = np.asarray(fit.forecast(horizon), dtype=float)
-        fitted = np.asarray(fit.fittedvalues, dtype=float)[: hist.size]
-        if np.nanmin(hist) >= 0:
-            fc = np.maximum(fc, 0.0)
-        resid = hist - fitted
-        resid = resid[np.isfinite(resid)]
-        std = float(np.std(resid)) if resid.size else 0.0
-        return fc, fitted, std
-    except Exception:
-        mean = float(np.mean(hist))
-        return np.full(horizon, mean), np.full(hist.size, mean), 0.0
+    fc = np.asarray(fit.forecast(horizon), dtype=float)
+    if not np.all(np.isfinite(fc)):
+        raise ValueError("SARIMA produced non-finite forecasts")
+    fitted = np.asarray(fit.fittedvalues, dtype=float)[: hist.size]
+    if np.nanmin(hist) >= 0:
+        fc = np.maximum(fc, 0.0)
+    resid = hist - fitted
+    resid = resid[np.isfinite(resid)]
+    std = float(np.std(resid)) if resid.size else 0.0
+    return fc, fitted, std

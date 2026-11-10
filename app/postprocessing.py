@@ -41,8 +41,9 @@ def select_forecast(
         stacked = np.vstack([candidates[n] for n in names])
         return "ensemble_median", np.nanmedian(stacked, axis=0)
 
-    # best_fit / weighted_average → lowest in-sample MSE using fitted proxy (last hist mean of fc)
-    # Candidates are future-only; score by stability vs last history window
+    # "stability" heuristic (also the pure-function meaning of best_fit): prefer the model
+    # whose first forecasts sit closest to the recent history level. The engine itself
+    # implements best_fit as a holdout (out-of-sample) error comparison — see selection.py.
     best_name = names[0]
     best_err = float("inf")
     hist_tail = history[-min(len(history), 6) :] if history.size else np.array([])
@@ -62,30 +63,61 @@ def apply_bias_correction(
     residuals: np.ndarray,
     method: str = "mean",
     lookback: int = 6,
+    actuals: Optional[np.ndarray] = None,
+    max_ratio: float = 0.5,
+    min_points: int = 3,
+    non_negative: bool = True,
 ) -> np.ndarray:
     """
-    Adjust forecasts by historical forecast bias (actual - fitted residuals flipped).
-    residuals should be (fitted - actual) so positive = over-forecast.
+    Adjust forecasts by historical forecast bias.
+
+    ``residuals`` are (forecast - actual): positive = over-forecast.
+
+    - mean / median: subtract the average (or median) error over the lookback.
+    - proportional: relative bias = Σ(forecast - actual) / Σ(actual) over the lookback,
+      clamped to ±max_ratio, then forecast × (1 - ratio). ``actuals`` (same length and
+      order as ``residuals``) is required; without it, or when Σ(actual) ≈ 0, the
+      forecast is returned unchanged.
+
+    Fewer than ``min_points`` usable residuals → no correction. With non_negative the
+    result is floored at 0.
     """
     fc = np.asarray(forecasts, dtype=float).copy()
-    res = np.asarray(residuals, dtype=float)
-    res = res[np.isfinite(res)]
-    if res.size == 0:
+    res_all = np.asarray(residuals, dtype=float).ravel()
+    act_all = None
+    if actuals is not None:
+        act_all = np.asarray(actuals, dtype=float).ravel()
+        if act_all.size != res_all.size:
+            act_all = None
+    mask = np.isfinite(res_all)
+    if act_all is not None:
+        mask = mask & np.isfinite(act_all)
+    res = res_all[mask]
+    act = act_all[mask] if act_all is not None else None
+    if res.size < max(1, int(min_points or 1)):
         return fc
     lookback = max(1, int(lookback or 6))
     window = res[-lookback:]
     method = (method or "mean").lower().replace("_bias", "")
 
-    if method == "median":
-        bias = float(np.median(window))
-        return fc - bias
     if method == "proportional":
-        scale = float(np.mean(np.abs(window))) + 1e-9
-        bias_ratio = float(np.mean(window)) / scale
-        return fc * (1.0 - bias_ratio)
-    # mean
-    bias = float(np.mean(window))
-    return fc - bias
+        if act is None:
+            return fc
+        act_window = act[-lookback:]
+        denom = float(np.sum(act_window))
+        if abs(denom) < 1e-9:
+            return fc
+        ratio = float(np.sum(window)) / denom
+        limit = abs(float(max_ratio)) if max_ratio is not None else 0.5
+        ratio = max(-limit, min(limit, ratio))
+        out = fc * (1.0 - ratio)
+    elif method == "median":
+        out = fc - float(np.median(window))
+    else:
+        out = fc - float(np.mean(window))
+    if non_negative:
+        out = np.maximum(out, 0.0)
+    return out
 
 
 def resolve_bias_config(postprocessing: Any) -> Optional[Dict[str, Any]]:
@@ -106,5 +138,20 @@ def resolve_bias_config(postprocessing: Any) -> Optional[Dict[str, Any]]:
             or postprocessing.get("biasLookbackPeriods")
             or 12
         )
-        return {"method": str(method), "lookbackPeriods": int(lookback)}
+        max_ratio = bc.get("maxRatio", postprocessing.get("biasMaxRatio", 0.5))
+        min_points = bc.get("minPoints", postprocessing.get("biasMinPoints", 3))
+        try:
+            max_ratio = float(max_ratio)
+        except (TypeError, ValueError):
+            max_ratio = 0.5
+        try:
+            min_points = int(min_points)
+        except (TypeError, ValueError):
+            min_points = 3
+        return {
+            "method": str(method),
+            "lookbackPeriods": int(lookback),
+            "maxRatio": max_ratio,
+            "minPoints": min_points,
+        }
     return None

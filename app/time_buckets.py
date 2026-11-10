@@ -52,17 +52,21 @@ def generate_future_buckets(last_bucket: str, horizon: int, granularity: str) ->
 
     week_m = re.match(r"^(\d{4})-W(\d{2})$", last)
     if week_m or g in ("weekly", "week"):
+        # Step real ISO weeks so 53-week years (e.g. 2026-W53) are not skipped.
         if week_m:
             y, w = int(week_m.group(1)), int(week_m.group(2))
+            try:
+                monday = datetime.fromisocalendar(y, w, 1)
+            except ValueError:
+                monday = datetime.fromisocalendar(y, 52, 1)
         else:
             today = datetime.utcnow()
-            y, w = today.year, today.isocalendar()[1]
+            iso = today.isocalendar()
+            monday = datetime.fromisocalendar(iso[0], iso[1], 1)
         for _ in range(horizon):
-            w += 1
-            if w > 52:
-                w = 1
-                y += 1
-            out.append(f"{y:04d}-W{w:02d}")
+            monday = monday + timedelta(weeks=1)
+            iso = monday.isocalendar()
+            out.append(f"{iso[0]:04d}-W{iso[1]:02d}")
         return out
 
     q_m = re.match(r"^(\d{4})-Q(\d)$", last)

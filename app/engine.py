@@ -31,23 +31,34 @@ from .preprocessing import (
     step_key_figures,
     trim_trailing_empty,
 )
+from .selection import select_by_holdout, selection_measure
 from .time_buckets import generate_future_buckets, seasonal_period
 
 logger = logging.getLogger("forecast_service")
 
 
-def _bucket_variants(bucket: str) -> List[str]:
+def _is_monthly(granularity: Optional[str]) -> bool:
+    return str(granularity or "monthly").lower().strip() in ("monthly", "month")
+
+
+def _bucket_variants(bucket: str, granularity: Optional[str] = "monthly") -> List[str]:
+    """Equivalent labels for one bucket.
+
+    Monthly axes accept both ``YYYY-MM`` and ``YYYY-MM-DD`` (month start). Daily and
+    weekly axes match the exact date only — a month alias there would copy one day's
+    value onto every day of that month.
+    """
     b = str(bucket)
     variants = [b]
-    if len(b) >= 7:
-        variants.append(b[:7])
     if len(b) >= 10:
         variants.append(b[:10])
+    if _is_monthly(granularity) and len(b) >= 7:
+        variants.append(b[:7])
     return variants
 
 
 def _align_to_buckets(
-    series: List[Any], buckets: List[str]
+    series: List[Any], buckets: List[str], granularity: Optional[str] = "monthly"
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Map a raw {timeBucket, value} list onto the primary bucket axis (NaN when absent).
 
@@ -67,7 +78,7 @@ def _align_to_buckets(
         except (TypeError, ValueError):
             val = np.nan
         overlay = bool(item.get("overlay") or item.get("adjustedHistoryOverlay"))
-        for key in _bucket_variants(tb):
+        for key in _bucket_variants(tb, granularity):
             if overlay or key not in lookup:
                 lookup[key] = val
                 overlay_lookup[key] = overlay or overlay_lookup.get(key, False)
@@ -75,7 +86,7 @@ def _align_to_buckets(
     out = np.full(len(buckets), np.nan, dtype=float)
     mask = np.zeros(len(buckets), dtype=bool)
     for i, bucket in enumerate(buckets):
-        for key in _bucket_variants(bucket):
+        for key in _bucket_variants(bucket, granularity):
             if key in lookup:
                 out[i] = lookup[key]
                 mask[i] = bool(overlay_lookup.get(key))
@@ -106,11 +117,45 @@ def _series_entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str]:
     return pid, lid, cid
 
 
+def _key_figure_index(payload: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Index seriesByKeyFigure once per request (was a full scan per series × key figure)."""
+    cached = payload.get("_kfIndex")
+    if isinstance(cached, dict) and cached.get("_raw_id") == id(raw):
+        return cached["index"]
+    index: Dict[str, Dict[str, Any]] = {}
+    for kf_id, entries in raw.items():
+        if not isinstance(entries, list):
+            continue
+        by_po: Dict[str, Any] = {}
+        by_plc: Dict[Tuple[str, str, str], Any] = {}
+        by_pl: Dict[Tuple[str, str], Any] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_po = str(entry.get("planningObjectId") or "").strip()
+            entry_base = str(entry.get("basePlanningObjectId") or "").strip()
+            # first entry wins for a planning object (by its own id or its base PO id)
+            if entry_po and entry_po not in by_po:
+                by_po[entry_po] = entry
+            if entry_base and entry_base not in by_po:
+                by_po[entry_base] = entry
+            ep, el, ec = _series_entry_identity(entry)
+            if ep and el:
+                if ec:
+                    by_plc[(ep, el, ec)] = entry  # last wins
+                else:
+                    by_pl[(ep, el)] = entry  # last wins
+        index[str(kf_id)] = {"by_po": by_po, "by_plc": by_plc, "by_pl": by_pl}
+    payload["_kfIndex"] = {"_raw_id": id(raw), "index": index}
+    return index
+
+
 def _series_by_key_figure(
     payload: Dict[str, Any],
     po_id: str,
     buckets: List[str],
     attrs: Optional[Dict[str, Any]] = None,
+    granularity: Optional[str] = "monthly",
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """Per-key-figure history for this planning object, aligned to the primary buckets.
 
@@ -126,34 +171,23 @@ def _series_by_key_figure(
     want_pid = str(attrs.get("product_id") or attrs.get("PRODUCT_ID") or "").strip()
     want_lid = str(attrs.get("location_id") or attrs.get("LOCATION_ID") or "").strip()
     want_cid = str(attrs.get("customer_id") or attrs.get("CUSTOMER_ID") or "").strip()
+    index = _key_figure_index(payload, raw)
     resolved: Dict[str, np.ndarray] = {}
     overlay_masks: Dict[str, np.ndarray] = {}
-    for kf_id, entries in raw.items():
-        if not isinstance(entries, list):
-            continue
-        matched = None
-        identity_hit = None
-        pl_hit = None
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            entry_po = str(entry.get("planningObjectId") or "").strip()
-            entry_base = str(entry.get("basePlanningObjectId") or "").strip()
-            if matched is None and (entry_po == po_id or (entry_base and entry_base == po_id)):
-                matched = entry
-                # keep scanning for a P×L edit series — do not break
-            ep, el, ec = _series_entry_identity(entry)
-            if want_pid and want_lid and want_cid and ep == want_pid and el == want_lid and ec == want_cid:
-                identity_hit = entry
-            # P×L Adjusted edits (no customer) apply to every customer leaf of that warehouse.
-            if want_pid and want_lid and ep == want_pid and el == want_lid and not ec:
-                pl_hit = entry
+    for kf_id, idx in index.items():
+        # Same rules as a full scan: first planning-object match; last P×L×C match;
+        # last P×L entry without customer (P×L Adjusted edits apply to every customer leaf).
+        matched = idx["by_po"].get(po_id)
+        identity_hit = (
+            idx["by_plc"].get((want_pid, want_lid, want_cid)) if (want_pid and want_lid and want_cid) else None
+        )
+        pl_hit = idx["by_pl"].get((want_pid, want_lid)) if (want_pid and want_lid) else None
         chosen = matched or identity_hit or pl_hit
         if chosen is None:
             continue
-        arr, mask = _align_to_buckets(chosen.get("series") or [], buckets)
+        arr, mask = _align_to_buckets(chosen.get("series") or [], buckets, granularity)
         if pl_hit is not None and pl_hit is not chosen:
-            pl_arr, _pl_mask = _align_to_buckets(pl_hit.get("series") or [], buckets)
+            pl_arr, _pl_mask = _align_to_buckets(pl_hit.get("series") or [], buckets, granularity)
             finite_pl = np.isfinite(pl_arr)
             arr = np.where(finite_pl, pl_arr, arr)
             # P×L Adjusted cells (including 0) are planner edits — protect from IQR.
@@ -349,8 +383,10 @@ def _run_algorithm(
     elif atype in ("sarima", "arima"):
         fc, fitted, std = forecast_sarima(history, horizon, params, seasonal_periods=sp)
     else:
-        fc, fitted, std = forecast_simple_moving_average(history, horizon, {"window": 3, "forecastMode": "rolling"})
-        atype = f"fallback_sma_for_{atype or 'unknown'}"
+        # Never run a different model under this algorithm's name — fail it visibly.
+        raise ValueError(
+            f"Unknown algorithm type '{alg.get('type')}'. Supported: {', '.join(SUPPORTED_ALGORITHMS)}"
+        )
 
     fc = np.asarray(fc, dtype=float).ravel()
     if fc.size < horizon:
@@ -358,7 +394,66 @@ def _run_algorithm(
         fc = np.concatenate([fc, np.full(horizon - fc.size, pad)])
     elif fc.size > horizon:
         fc = fc[:horizon]
-    return atype, fc, np.asarray(fitted, dtype=float), float(std or 0.0)
+    fitted = np.asarray(fitted, dtype=float)
+    # Demand cannot be negative: when history has no negatives, floor every model at 0
+    # (a falling trend 40, 30, 20 forecasts 10, 0, 0 — not -10, -20). A profile can opt
+    # out per algorithm with allowNegative for series such as signed returns.
+    if not allows_negative(params) and history.size and np.nanmin(history) >= 0:
+        fc = np.maximum(fc, 0.0)
+        fitted = np.where(np.isfinite(fitted), np.maximum(fitted, 0.0), fitted)
+    return atype, fc, fitted, float(std or 0.0)
+
+
+def allows_negative(params: Dict[str, Any]) -> bool:
+    """True only when an algorithm explicitly allows negative forecasts."""
+    raw = params.get("allowNegative")
+    if raw is None:
+        clamp = params.get("clampNonNegative", params.get("nonNegative"))
+        if clamp is None:
+            return False
+        raw = not (clamp is True or str(clamp).lower() in ("1", "true", "yes"))
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes")
+    return bool(raw)
+
+
+def _engine_info() -> Dict[str, Any]:
+    """Engine + library versions, returned with every run for reproducibility."""
+    libs: Dict[str, Optional[str]] = {}
+    for name in ("numpy", "pandas", "statsmodels", "sklearn", "xgboost"):
+        try:
+            module = __import__(name)
+            libs[name] = getattr(module, "__version__", None)
+        except Exception:
+            libs[name] = None
+    return {"engineVersion": "1.1.0", "libraries": libs}
+
+
+ENGINE_INFO = _engine_info()
+
+
+SUPPORTED_ALGORITHMS = [
+    "simple_average",
+    "simple_moving_average",
+    "weighted_average",
+    "weighted_moving_average",
+    "moving_average",
+    "exponential_smoothing",
+    "regression",
+    "gradient_boosting",
+    "croston",
+    "sarima",
+]
+ALGORITHM_ALIASES = {
+    "mean": "simple_average",
+    "average": "simple_average",
+    "sma": "simple_moving_average",
+    "wa": "weighted_average",
+    "wma": "weighted_moving_average",
+    "gradientboosting": "gradient_boosting",
+    "gb": "gradient_boosting",
+    "arima": "sarima",
+}
 
 
 def _algo_key(alg: Dict[str, Any], atype: str, used: set) -> str:
@@ -381,6 +476,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
     horizon = int(payload.get("forecastPeriods") or 6)
     horizon = max(1, horizon)
     granularity = str(payload.get("timeGranularity") or "monthly")
+    history_closed = bool(payload.get("historyClosed"))
     algorithms = _as_algo_list(payload, run_fc)
     strategy = extract_selection_strategy(payload.get("postprocessingSteps")) if run_post or run_fc else "best_fit"
     bias_cfg = resolve_bias_config(payload.get("postprocessingSteps")) if run_post else None
@@ -415,6 +511,9 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
     error_accum: Dict[str, List[float]] = {}
     error_by_series: Dict[str, Dict[str, float]] = {}
 
+    algorithm_failures: List[Dict[str, Any]] = []
+    selection_by_series: Dict[str, Dict[str, Any]] = {}
+
     # Per-algorithm and preprocessing outputs across all POs
     algorithm_outputs: Dict[str, List[Dict[str, Any]]] = {}
     preprocessing_outputs: Dict[str, List[Dict[str, Any]]] = {}
@@ -436,15 +535,22 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
         if values.size == 0 and not stored_fc_early:
             continue
 
-        # Drop trailing blank/zero months (empty grid cells) so trend continues: 40,30,20 → 10,0,-10,...
+        # Drop trailing empty buckets. When the caller has already ended history at the
+        # last closed period (historyClosed), trailing zeros are real zero demand and are
+        # kept so the forecast follows the trend (e.g. 9 months of sales then 3 zeros).
+        # Otherwise blank future grid cells (stored as 0) are trimmed as before.
         if values.size:
-            buckets, values = trim_trailing_empty(buckets, values)
+            buckets, values = trim_trailing_empty(
+                buckets, values, treat_zero_as_empty=not history_closed
+            )
         if values.size == 0 and not stored_fc_early:
             continue
 
         intermediates: Dict[str, Any] = {}
         if values.size:
-            series_by_kf, _ = _series_by_key_figure(payload, po_id, buckets, attrs)
+            series_by_kf, overlay_masks = _series_by_key_figure(
+                payload, po_id, buckets, attrs, granularity
+            )
             kf_outputs: Dict[str, np.ndarray] = {}
             values, intermediates = apply_preprocessing(
                 values,
@@ -452,6 +558,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return_intermediates=True,
                 series_by_kf=series_by_kf,
                 kf_outputs=kf_outputs,
+                series_overlay=overlay_masks,
             )
 
             # Forecasting reads its own Input KF, which is normally a preprocessing Output KF
@@ -489,28 +596,54 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
             if not stored_fc:
                 continue
             forecast_points = list(stored_fc)
-            if bias_cfg is not None and values.size and buckets:
+            supplied = (payload.get("biasResiduals") or {}).get(po_id) if bias_cfg is not None else None
+            if isinstance(supplied, dict) and supplied.get("residuals"):
+                # Residuals measured by the caller from forecast snapshots vs actuals.
+                fc_arr = np.array([pt["value"] for pt in forecast_points], dtype=float)
+                res_arr = np.asarray(supplied.get("residuals") or [], dtype=float)
+                act_arr = np.asarray(supplied.get("actuals") or [], dtype=float)
+                hist_nonneg = (not act_arr.size) or float(np.nanmin(act_arr)) >= 0
+                corrected = apply_bias_correction(
+                    fc_arr,
+                    res_arr,
+                    method=bias_cfg.get("method", "mean"),
+                    lookback=int(bias_cfg.get("lookbackPeriods") or 12),
+                    actuals=act_arr if act_arr.size == res_arr.size else None,
+                    max_ratio=bias_cfg.get("maxRatio", 0.5),
+                    min_points=bias_cfg.get("minPoints", 3),
+                    non_negative=hist_nonneg,
+                )
+                for i, pt in enumerate(forecast_points):
+                    if i < corrected.size and np.isfinite(corrected[i]):
+                        pt["value"] = float(corrected[i])
+            elif bias_cfg is not None and values.size and buckets:
                 hist_lookup = {
                     str(tb): float(values[i])
                     for i, tb in enumerate(buckets)
                     if i < values.size and np.isfinite(values[i])
                 }
                 residuals = []
+                matched_actuals = []
                 for pt in forecast_points:
                     actual = None
-                    for key in _bucket_variants(pt["timeBucket"]):
+                    for key in _bucket_variants(pt["timeBucket"], granularity):
                         if key in hist_lookup:
                             actual = hist_lookup[key]
                             break
                     if actual is None:
                         continue
                     residuals.append(pt["value"] - actual)
+                    matched_actuals.append(actual)
                 if residuals:
                     corrected = apply_bias_correction(
                         np.array([pt["value"] for pt in forecast_points], dtype=float),
                         np.array(residuals, dtype=float),
                         method=bias_cfg.get("method", "mean"),
                         lookback=int(bias_cfg.get("lookbackPeriods") or 12),
+                        actuals=np.array(matched_actuals, dtype=float),
+                        max_ratio=bias_cfg.get("maxRatio", 0.5),
+                        min_points=bias_cfg.get("minPoints", 3),
+                        non_negative=bool(values.size) and float(np.nanmin(values)) >= 0,
                     )
                     for i, pt in enumerate(forecast_points):
                         if i < corrected.size and np.isfinite(corrected[i]):
@@ -537,13 +670,21 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 atype, fc, fitted, std = _run_algorithm(alg, values, horizon, granularity)
             except Exception as e:
-                logger.exception(
+                logger.warning(
                     "Algorithm %s failed for %s: %s",
                     alg.get("type") or alg.get("id"),
                     po_id,
                     e,
                 )
-                # Skip failed algorithm; others still write to the grid
+                # Skip the failed algorithm (others still write) — and report it.
+                algorithm_failures.append(
+                    {
+                        "algorithmId": alg.get("algorithmId") or alg.get("id"),
+                        "type": alg.get("type"),
+                        "seriesId": po_id,
+                        "error": str(e),
+                    }
+                )
                 continue
             key = _algo_key(alg, atype, key_used)
             candidates[key] = fc
@@ -563,7 +704,26 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
             fitted = values.copy()
             std = 0.0
         else:
-            selected_name, forecast_values = select_forecast(candidates, values, strategy)
+            if strategy in ("best_fit", "holdout", "auto") and candidates:
+                key_types = {k: (algorithm_meta.get(k) or {}).get("type", "") for k in candidates}
+                chosen, sel_info = select_by_holdout(
+                    candidates,
+                    key_to_alg,
+                    key_types,
+                    values,
+                    lambda a, train, h: _run_algorithm(a, train, h, granularity)[1],
+                    selection_measure(measures),
+                    error_horizon,
+                )
+                selected_name = chosen or next(iter(candidates))
+                forecast_values = np.asarray(candidates[selected_name], dtype=float)
+                selection_by_series[po_id] = {
+                    **sel_info,
+                    "selectedType": key_types.get(selected_name),
+                }
+            else:
+                selected_name, forecast_values = select_forecast(candidates, values, strategy)
+                selection_by_series[po_id] = {"strategy": strategy, "selected": selected_name}
             if forecast_values.size < horizon:
                 pad = float(forecast_values[-1]) if forecast_values.size else float(np.nanmean(values))
                 forecast_values = np.concatenate(
@@ -586,6 +746,10 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
                     residuals,
                     method=bias_cfg.get("method", "mean"),
                     lookback=int(bias_cfg.get("lookbackPeriods") or 12),
+                    actuals=values,
+                    max_ratio=bias_cfg.get("maxRatio", 0.5),
+                    min_points=bias_cfg.get("minPoints", 3),
+                    non_negative=bool(values.size) and float(np.nanmin(values)) >= 0,
                 )
 
         last_bucket = buckets[-1]
@@ -649,7 +813,7 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in metrics.items():
             error_accum.setdefault(k, []).append(v)
 
-        logger.info(
+        logger.debug(
             "Forecasted %s selected=%s horizon=%s n_hist=%s err_horizon=%s",
             po_id,
             selected_name,
@@ -661,6 +825,13 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
     errors = {
         k: float(np.mean(vs)) for k, vs in error_accum.items() if vs and np.isfinite(np.mean(vs))
     }
+    logger.info(
+        "Forecast run: series=%s horizon=%s algorithms=%s failures=%s",
+        len(time_series),
+        horizon,
+        len(algorithms),
+        len(algorithm_failures),
+    )
 
     if not all_forecasts and run_fc:
         first = time_series[0] if time_series else {}
@@ -691,6 +862,9 @@ def run_forecast(payload: Dict[str, Any]) -> Dict[str, Any]:
         "preprocessingMeta": prep_meta,
         "errors": errors,
         "errorMetrics": error_by_series,
+        "algorithmFailures": algorithm_failures,
+        "selection": selection_by_series,
+        "engine": ENGINE_INFO,
         "confidence": all_confidence,
         "exPostForecasts": all_expost,
         "fitted": all_fitted,

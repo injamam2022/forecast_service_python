@@ -1,11 +1,15 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.6.0
-numpy>=1.26.0
-pandas>=2.2.0
-statsmodels>=0.14.1
-scikit-learn>=1.4.0
-xgboost>=2.0.0
-python-dotenv>=1.0.0
-httpx>=0.27.0
-pytest>=8.0.0
+# Exact versions so every environment produces the same forecasts.
+# requirements.lock pins the full dependency tree (pip freeze of a working venv):
+#   pip install -r requirements.lock
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+pydantic==2.13.4
+numpy==2.2.6
+pandas==2.3.3
+statsmodels==0.14.6
+scikit-learn==1.7.2
+# Required: gradient_boosting fails visibly (algorithmFailures) when XGBoost is missing.
+xgboost==3.2.0
+python-dotenv==1.2.2
+httpx==0.28.1
+pytest==9.1.1
