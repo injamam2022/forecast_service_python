@@ -62,7 +62,10 @@ def trim_trailing_empty(
 
 
 def _protect_planner_edits(params: Dict[str, Any]) -> bool:
-    raw = params.get("protectPlannerEdits", params.get("protect_planner_edits", True))
+    """Opt-in only. A value typed into the step's input KF (e.g. Adjusted Sales History)
+    is history like any other and must go through outlier correction; otherwise a typed
+    900 among ~150s passes straight into Outlier Correction / Missing / Manual."""
+    raw = params.get("protectPlannerEdits", params.get("protect_planner_edits", False))
     if isinstance(raw, str):
         return raw.strip().lower() not in ("0", "false", "no", "off")
     return bool(raw)
@@ -126,8 +129,8 @@ def _outlier_correction(
         finite_low = np.isfinite(out) & (np.abs(out) > 1e-12) & (out < low)
         out = np.where(finite_low, low_val, out)
         out = np.where(out > high, high_val, out)
-    # Planner-entered cells (a typed 0 or 1000) are deliberate — keep them as entered
-    # unless the step sets protectPlannerEdits = false.
+    # Typed input cells are corrected like any other value (a typed 0 is still kept,
+    # see finite_low above). Only a step with protectPlannerEdits = true keeps them.
     if protect_mask is not None and _protect_planner_edits(params):
         guard = np.asarray(protect_mask, dtype=bool)
         if guard.shape == out.shape:

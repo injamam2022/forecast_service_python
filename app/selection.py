@@ -76,6 +76,25 @@ def holdout_error(actual: np.ndarray, forecast: np.ndarray, measure: str = "WMAP
     return float(np.sum(np.abs(err)) / denom)
 
 
+def _tie_round(score: float) -> float:
+    if not np.isfinite(score):
+        return score
+    return float(f"{score:.9g}")
+
+
+def _recent_level_error(values: np.ndarray, forecast: Optional[np.ndarray], h: int, measure: str) -> float:
+    """Error of a model's first ``h`` forecast periods against the last ``h`` actuals."""
+    if forecast is None:
+        return float("inf")
+    v = np.asarray(values, dtype=float).ravel()
+    f = np.asarray(forecast, dtype=float).ravel()
+    if f.size == 0 or v.size == 0:
+        return float("inf")
+    k = min(h, v.size, f.size)
+    score = holdout_error(v[-k:], f[:k], measure)
+    return score if np.isfinite(score) else float("inf")
+
+
 def holdout_periods(n: int, configured: Optional[int]) -> int:
     """Holdout length: the configured error horizon (default 6), capped at a third of the
     history so a long reporting horizon never prevents model selection."""
@@ -92,7 +111,14 @@ def select_by_holdout(
     measure: str,
     configured_h: Optional[int] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Return (selected candidate key, selection info)."""
+    """Return (selected candidate key, selection info).
+
+    Ties on the holdout score (equal up to float noise) are broken by how close the
+    model's forecast is to the last ``h`` actuals, then by model simplicity.
+    Example: 18 months of 100 then 6 zeros — every model trained on the 100s misses the
+    zero holdout by ~100, so a model that forecasts the recent zeros (moving average)
+    wins instead of the 24-month average (75).
+    """
     keys: List[str] = list(candidates.keys())
     info: Dict[str, Any] = {"strategy": "best_fit", "measure": measure, "scores": {}}
     if not keys:
@@ -110,7 +136,7 @@ def select_by_holdout(
         return keys[0], info
 
     train, test = np.asarray(values, dtype=float)[:-h], np.asarray(values, dtype=float)[-h:]
-    best_key, best = None, (float("inf"), float("inf"))
+    best_key, best = None, (float("inf"), float("inf"), float("inf"))
     for key in keys:
         try:
             fc_h = run_fn(key_to_alg[key], train, h)
@@ -120,7 +146,13 @@ def select_by_holdout(
             info.setdefault("holdoutFailures", {})[key] = str(exc)
             continue
         info["scores"][key] = score if np.isfinite(score) else None
-        rank = (score, complexity_rank(key_to_type.get(key, "")))
+        # Scores equal up to float noise are a tie (e.g. a holdout of all zeros where
+        # every model misses by the same amount) — the simpler model wins, not 1e-14.
+        rank = (
+            _tie_round(score),
+            _tie_round(_recent_level_error(values, candidates.get(key), h, measure)),
+            complexity_rank(key_to_type.get(key, "")),
+        )
         if np.isfinite(score) and rank < best:
             best, best_key = rank, key
     if best_key is None:

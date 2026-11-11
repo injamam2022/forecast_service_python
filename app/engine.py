@@ -324,10 +324,12 @@ def _error_metrics(
     for m in measures or ["MAPE"]:
         key = str(m).upper()
         if key == "MAPE":
-            denom = np.where(np.abs(a) < 1e-9, np.nan, a)
-            mape = float(np.nanmean(np.abs(residuals / denom)))
-            if np.isfinite(mape):
-                result["MAPE"] = mape
+            # Undefined when every actual is 0 (no sales): skip instead of warning on 0/0.
+            nz = np.abs(a) > 1e-9
+            if nz.any():
+                mape = float(np.mean(np.abs(residuals[nz] / a[nz])))
+                if np.isfinite(mape):
+                    result["MAPE"] = mape
         elif key == "SMAPE":
             denom = np.abs(a) + np.abs(f) + 1e-9
             smape = float(np.mean(2.0 * np.abs(residuals) / denom))
