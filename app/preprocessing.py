@@ -138,9 +138,43 @@ def _outlier_correction(
     return out
 
 
-def _missing_value_handling(values: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
-    out = values.copy().astype(float)
+def _zero_as_missing(params: Dict[str, Any]) -> bool:
+    raw = params.get("zeroAsMissing", params.get("treatZeroAsMissing", params.get("zero_as_missing", True)))
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+    return bool(raw)
+
+
+def _missing_value_handling(
+    values: np.ndarray,
+    params: Dict[str, Any],
+    first_sale_index: Optional[int] = None,
+) -> np.ndarray:
+    """Fill missing months. A month with 0 after the first sale counts as missing (a typed
+    0 or a month with no sales) and is filled by the method; months before the first sale
+    stay 0 (no demand before launch). ``first_sale_index`` (from the raw history) keeps a
+    0 typed into the first sold month counted as missing. ``zeroAsMissing: false`` fills
+    empty cells only."""
+    out = np.asarray(values, dtype=float).copy()
     method = str(params.get("method") or "forward_fill").lower()
+    if method == "zero" or not _zero_as_missing(params):
+        return _fill_missing(out, method)
+    sold = np.isfinite(out) & (np.abs(out) > 1e-12)
+    if not sold.any():
+        # Nothing sold in the window: there is no level to fill with.
+        return np.where(np.isfinite(out), out, 0.0)
+    start = int(np.argmax(sold))
+    if first_sale_index is not None and 0 <= int(first_sale_index) < start:
+        start = int(first_sale_index)
+    head = np.where(np.isfinite(out[:start]), out[:start], 0.0)
+    tail = out[start:].copy()
+    tail[np.isfinite(tail) & (np.abs(tail) <= 1e-12)] = np.nan
+    return np.concatenate([head, _fill_missing(tail, method)])
+
+
+def _fill_missing(values: np.ndarray, method: str) -> np.ndarray:
+    """Fill NaN cells of ``values`` with ``method``."""
+    out = values.copy().astype(float)
     if method in ("interpolate", "interpolation"):
         # linear interpolation over NaNs
         n = out.size
@@ -172,7 +206,11 @@ def _missing_value_handling(values: np.ndarray, params: Dict[str, Any]) -> np.nd
                 last = rev[i]
             elif np.isfinite(last):
                 rev[i] = last
-        return rev[::-1]
+        out = rev[::-1]
+        if np.isfinite(out).all() or not np.isfinite(out).any():
+            return out
+        # Trailing gaps have nothing after them: carry the last known value forward.
+        return _fill_missing(out, "forward_fill")
 
     # forward_fill (default)
     last = np.nan
@@ -246,6 +284,7 @@ def apply_step(
     values: np.ndarray,
     step: Dict[str, Any],
     protect_mask: Optional[np.ndarray] = None,
+    first_sale_index: Optional[int] = None,
 ) -> np.ndarray:
     if not step or step.get("enabled") is False:
         return values
@@ -257,7 +296,7 @@ def apply_step(
     if stype in ("outlier_correction", "outlier"):
         return _outlier_correction(values, params, protect_mask=protect_mask)
     if stype in ("missing_value_handling", "missing_value", "missing"):
-        return _missing_value_handling(values, params)
+        return _missing_value_handling(values, params, first_sale_index=first_sale_index)
     if stype == "substitution":
         return _substitution(values, params)
     if stype in ("historical_adjustment", "historical_adj", "manual_adjustment", "manual_adj"):
@@ -317,6 +356,9 @@ def apply_preprocessing(
     {outputKeyFigureId: values} so callers can resolve the forecasting Input KF.
     """
     current = np.asarray(values, dtype=float).copy()
+    # First month with sales in the raw history: months before it are pre-launch zeros.
+    raw_sold = np.isfinite(current) & (np.abs(current) > 1e-12)
+    first_sale_index = int(np.argmax(raw_sold)) if raw_sold.any() else None
     intermediates: Dict[str, np.ndarray] = {}
     produced: Dict[str, np.ndarray] = kf_outputs if kf_outputs is not None else {}
     if not steps:
@@ -336,7 +378,8 @@ def apply_preprocessing(
             protect = np.asarray(series_overlay[in_kf], dtype=bool)
             if protect.size != step_input.size:
                 protect = None
-        current = apply_step(step_input, step, protect_mask=protect)
+        fsi = first_sale_index if step_input.size == current.size else None
+        current = apply_step(step_input, step, protect_mask=protect, first_sale_index=fsi)
         step_id = str(step.get("stepId") or step.get("id") or step.get("type") or "")
         if step_id:
             intermediates[step_id] = current.copy()
